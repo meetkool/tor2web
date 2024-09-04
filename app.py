@@ -45,7 +45,48 @@ def modify_html(content, base_url):
         src = img['src']
         img['src'] = re.sub(r'^http://127\.0\.0\.1:8080/.*base64,', 'data:image/png;base64,', src)
     
+    # Inject JavaScript to handle all outgoing requests
+    script = soup.new_tag('script')
+    script.string = """
+    (function() {
+        var originalFetch = window.fetch;
+        var originalXHR = window.XMLHttpRequest.prototype.open;
+
+        var currentOnionDomain = document.cookie.split('; ').find(row => row.startsWith('current_onion_domain=')).split('=')[1];
+
+        function modifyUrl(url) {
+            if (typeof url === 'string' && !url.startsWith('http://127.0.0.1:8080/')) {
+
+                return 'http://127.0.0.1:8080/' + (url.startsWith('/') ? currentOnionDomain + url : currentOnionDomain + '/' + url);
+            }
+            return url;
+        }
+
+        window.fetch = function(input, init) {
+            if (typeof input === 'string') {
+                input = modifyUrl(input);
+            } else if (input instanceof Request) {
+                input = new Request(modifyUrl(input.url), input);
+            }
+            return originalFetch.apply(this, arguments);
+        };
+
+        window.XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
+            url = modifyUrl(url);
+
+            return originalXHR.call(this, method, url, async, user, password);
+        };
+    })();
+    """
+    soup.body.append(script)
+
+
+
     return str(soup)
+# All route definitions go here
+@app.route('/')
+def index():
+    return "Hello, World!"
 
 @app.route('/health')
 def health_check():
@@ -61,15 +102,14 @@ def proxy(path):
         if not check_tor_connection():
             return "Tor is not working correctly", 500
 
-        # Extract the .onion domain from the path or use a default
+        onion_domain = request.cookies.get('current_onion_domain', '')
+    
+        if not path.startswith(onion_domain):
+            path = f"{onion_domain}/{path}"
+
         parts = path.split('/', 1)
-        if parts[0].endswith('.onion'):
-            onion_domain = parts[0]
-            subpath = parts[1] if len(parts) > 1 else ''
-        else:
-            # Use a default .onion domain if not provided
-            onion_domain = 'default_onion_domain.onion'  # Replace with your default .onion domain
-            subpath = path
+        onion_domain = parts[0]
+        subpath = parts[1] if len(parts) > 1 else ''
 
         url = f"http://{onion_domain}/{subpath}"
         app.logger.info(f"Attempting to access: {url}")
@@ -77,15 +117,22 @@ def proxy(path):
         headers = {key: value for (key, value) in request.headers if key != 'Host'}
         headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
 
-        # Handle POST requests
-        data = request.form if request.method == 'POST' else None
-        files = request.files if request.method == 'POST' else None
-
-        # Get or create session
+        if request.is_json:
+            data = request.get_json()
+        else:
+            data = request.form.to_dict()            
+            files = request.files if request.method == 'POST' else None
         session_id = request.cookies.get('session_id')
         if session_id not in sessions:
             sessions[session_id] = requests.Session()
         session = sessions[session_id]
+
+        app.logger.info(f"Request method: {request.method}")
+        app.logger.info(f"Request headers: {headers}")
+        app.logger.info(f"Request data: {data}")
+
+        if request.method == 'POST':
+            headers['Content-Type'] = request.content_type
 
         resp = session.request(
             method=request.method,
@@ -98,42 +145,33 @@ def proxy(path):
             stream=True
         )
 
+        if resp.status_code == 400:
+            app.logger.error(f"400 Bad Request: {resp.text}")
+            return f"Bad Request: The server couldn't process the request. Details: {resp.text}", 400
+
+        resp.raise_for_status()
+
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
         headers = [(name, value) for (name, value) in resp.raw.headers.items()
                    if name.lower() not in excluded_headers]
 
-        if resp.status_code in [301, 302, 303, 307, 308]:
-            # Handle redirects
-            location = resp.headers.get('Location')
-            if location:
-                if location.startswith('/'):
-                    new_url = f"{request.host_url}{onion_domain}{location}"
-                else:
-                    new_url = f"{request.host_url}{onion_domain}/{location}"
-                response = make_response(redirect(new_url, code=resp.status_code))
-                for cookie in resp.cookies:
-                    response.set_cookie(cookie.name, cookie.value, domain=request.host)
-                return response
+        def generate():
+            for chunk in resp.iter_content(chunk_size=1024):
+                yield chunk
 
-        content_type = resp.headers.get('Content-Type', '')
-        if 'text/html' in content_type:
-            content = modify_html(resp.content, url)
-            response = make_response(content)
-        else:
-            response = Response(stream_with_context(resp.iter_content(chunk_size=10*1024)), 
-                                resp.status_code, 
-                                headers)
+        response = Response(stream_with_context(generate()), resp.status_code, headers)
+        response.headers['Transfer-Encoding'] = 'chunked'
 
-        # Set cookies from the response
-        for cookie in resp.cookies:
-            response.set_cookie(cookie.name, cookie.value, domain=request.host)
+        if 'Content-Type' in resp.headers:
+            response.headers['Content-Type'] = resp.headers['Content-Type']
 
-        response.status_code = resp.status_code
-        response.headers.extend(headers)
+        response.set_cookie('current_onion_domain', onion_domain)
+    
         return response
 
     except RequestException as e:
         app.logger.error(f"Request error: {str(e)}")
+        app.logger.error(f"Response content: {e.response.content if e.response else 'No response'}")
         return f"Error accessing {path}: {str(e)}", 500
     except Exception as e:
         app.logger.error(f"Unexpected error: {str(e)}")
@@ -141,3 +179,11 @@ def proxy(path):
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=True)
+
+
+app.logger.info(f"Request method: {request.method}")
+app.logger.info(f"Request headers: {headers}")
+app.logger.info(f"Request data: {data}")
+
+if request.method == 'POST':
+    headers['Content-Type'] = request.content_type
