@@ -1,0 +1,4 @@
+flask
+requests
+pysocks
+beautifulsoup4==4.9.3
